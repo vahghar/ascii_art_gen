@@ -21,7 +21,7 @@ import base64
 import argparse
 from pathlib import Path
 from typing import Union, List, Optional, Tuple
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageOps
 
 
 # Curated Palettes (Calibrated optical density ramps)
@@ -1017,6 +1017,150 @@ class AsciiRenderer:
             sys.stdout.flush()
 
 
+    def render_to_gif(
+        self,
+        image_input: Union[str, Path, Image.Image],
+        output_file: Union[str, Path],
+        num_frames: int = 24,
+        fps: int = 12,
+        font_size: int = 10,
+        background: Tuple[int, int, int] = (4, 4, 6),
+        font_path: Optional[str] = None,
+    ) -> Path:
+        """
+        Renders the ASCII art as an animated GIF with flowing character motion.
+        Characters oscillate through the palette over time using sinusoidal flow,
+        simulating the HTML motion player in a portable, embeddable GIF format.
+
+        :param num_frames: Number of animation frames (24 = smooth ~2s loop).
+        :param fps: Frames per second.
+        :param font_size: Character height in pixels. Smaller = more detail, larger file.
+        :param background: RGB background colour tuple.
+        :param font_path: Path to a .ttf monospace font. Falls back to system fonts, then PIL default.
+        :return: Path to the saved GIF.
+        """
+        if isinstance(image_input, (str, Path)):
+            img = Image.open(str(image_input))
+        else:
+            img = image_input
+
+        target_w, target_h = self._calculate_dimensions(img.width, img.height)
+        processed_rgb = self._preprocess_image(img).resize(
+            (target_w, target_h), Image.Resampling.LANCZOS
+        )
+        gray_img = processed_rgb.convert("L")
+        if self.invert:
+            gray_img = ImageOps.invert(gray_img)
+
+        edge_chars = None
+        if self.edge_detection:
+            _, edge_chars = self._compute_edges_and_directions(gray_img)
+
+        gray_pixels = list(gray_img.getdata())
+        rgb_pixels = list(processed_rgb.getdata())
+
+        # ── Font resolution ────────────────────────────────────────────────────
+        font: ImageFont.ImageFont | ImageFont.FreeTypeFont
+        _loaded = False
+        if font_path:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                _loaded = True
+            except Exception:
+                pass
+        if not _loaded:
+            for _fname in [
+                "cour.ttf", "courbd.ttf",           # Windows Courier New
+                "DejaVuSansMono.ttf",               # Linux / macOS
+                "LiberationMono-Regular.ttf",
+                "Menlo.ttc",                        # macOS
+            ]:
+                try:
+                    font = ImageFont.truetype(_fname, font_size)
+                    _loaded = True
+                    break
+                except Exception:
+                    continue
+        if not _loaded:
+            font = ImageFont.load_default()
+
+        # Character cell size
+        _bbox = font.getbbox("W")
+        char_w = max(1, _bbox[2] - _bbox[0])
+        char_h = max(1, _bbox[3] - _bbox[1] + 2)  # +2px leading
+
+        canvas_w = target_w * char_w
+        canvas_h = target_h * char_h
+
+        palette = self.palette
+        palette_len = len(palette)
+        lum_cutoff = max(10, self.shadow_lift)
+        frame_ms = max(20, int(1000 / fps))
+
+        frames: List[Image.Image] = []
+
+        for f in range(num_frames):
+            # Map frame index to a full 2π cycle
+            t = (f / num_frames) * math.pi * 2
+
+            frame_img = Image.new("RGB", (canvas_w, canvas_h), background)
+            draw = ImageDraw.Draw(frame_img)
+
+            for y in range(target_h):
+                for x in range(target_w):
+                    idx = y * target_w + x
+                    lum = gray_pixels[idx]
+
+                    if lum < lum_cutoff:
+                        continue
+
+                    # Edge char takes priority
+                    if self.edge_detection and edge_chars and edge_chars[y][x]:
+                        char = edge_chars[y][x]
+                    else:
+                        # Sinusoidal flow: subtly oscillate the palette index over time
+                        base_ratio = lum / 255.0
+                        noise = (
+                            math.sin(x * 0.18 + t * 1.1) * 0.5
+                            + math.sin(y * 0.14 - t * 0.85) * 0.5
+                        ) * 0.14  # ±14% oscillation — visible but not distracting
+                        ratio = max(0.0, min(1.0, base_ratio + noise))
+                        if self.invert:
+                            ratio = 1.0 - ratio
+                        if palette[0] == " ":
+                            char_idx = int(ratio * (palette_len - 1))
+                        else:
+                            char_idx = int((1.0 - ratio) * (palette_len - 1))
+                        char = palette[char_idx]
+
+                    if char == " ":
+                        continue
+
+                    r, g, b = rgb_pixels[idx]
+                    if self.color_lift > 0:
+                        r = max(self.color_lift, r)
+                        g = max(self.color_lift, g)
+                        b = max(self.color_lift, b)
+
+                    draw.text((x * char_w, y * char_h), char, fill=(r, g, b), font=font)
+
+            frames.append(frame_img)
+
+        out_path = Path(output_file)
+        # GIF is 256-colour; convert each frame via quantize for best quality
+        pal_frames = [f.quantize(colors=256, method=Image.Quantize.MEDIANCUT) for f in frames]
+        pal_frames[0].save(
+            out_path,
+            format="GIF",
+            append_images=pal_frames[1:],
+            save_all=True,
+            duration=frame_ms,
+            loop=0,
+            optimize=True,
+        )
+        return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Image to High-Quality ASCII Converter with Natural Motion")
     parser.add_argument("image_path", type=str, help="Path to input image")
@@ -1035,6 +1179,9 @@ def main():
     parser.add_argument("-o", "--output", type=str, help="Save plain text output to file")
     parser.add_argument("--html", type=str, help="Export styled HTML output to file")
     parser.add_argument("--motion-html", type=str, help="Export interactive 60-FPS natural flow HTML player")
+    parser.add_argument("--gif", type=str, help="Export animated GIF with flowing character motion")
+    parser.add_argument("--gif-frames", type=int, default=24, help="Number of GIF animation frames (default: 24)")
+    parser.add_argument("--gif-fps", type=int, default=12, help="GIF frames per second (default: 12)")
     parser.add_argument("--live", choices=["flow", "currents", "wave", "breath"], help="Play live natural flow motion in terminal")
     parser.add_argument("--fps", type=int, default=24, help="FPS for live terminal motion (default: 24)")
 
@@ -1058,6 +1205,15 @@ def main():
         print(f"Starting live '{args.live}' motion in terminal (Press Ctrl+C to exit)...")
         time.sleep(1)
         renderer.play_motion_terminal(args.image_path, mode=args.live, fps=args.fps)
+    elif args.gif:
+        print(f"Rendering animated GIF ({args.gif_frames} frames @ {args.gif_fps} fps)...")
+        out = renderer.render_to_gif(
+            args.image_path,
+            output_file=args.gif,
+            num_frames=args.gif_frames,
+            fps=args.gif_fps,
+        )
+        print(f"GIF saved to: {out}")
     elif args.motion_html:
         renderer.render_motion_html(args.image_path, output_file=args.motion_html)
         print(f"Interactive Natural Flow HTML saved to: {args.motion_html}")

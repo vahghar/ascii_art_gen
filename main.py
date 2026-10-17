@@ -45,7 +45,7 @@ def test_single_image(image_path: Path):
     print(f"{'=' * 60}\n")
 
     # 1. Clean Studio ASCII (10-ramp, crisp, zero noise)
-    print("[1/6] Running Clean Studio ASCII...")
+    print("[1/7] Running Clean Studio ASCII...")
     clean_renderer = AsciiRenderer(
         width=130,
         aspect_ratio=0.50,
@@ -60,7 +60,7 @@ def test_single_image(image_path: Path):
     print(clean_ascii[:500] + "\n... (truncated, full saved to output/)\n")
 
     # 2. Smooth Detailed Typography (70-ramp)
-    print("[2/6] Running Smooth Detailed Typography...")
+    print("[2/7] Running Smooth Detailed Typography...")
     detailed_renderer = AsciiRenderer(
         width=130,
         aspect_ratio=0.50,
@@ -74,7 +74,7 @@ def test_single_image(image_path: Path):
     # (OUTPUT_DIR / f"{stem}_detailed.txt").write_text(detailed_ascii, encoding="utf-8")  # Disabled per user request
 
     # 3. Unicode Block Elements (Pixel Art Style)
-    print("[3/6] Running Unicode Block Elements...")
+    print("[3/7] Running Unicode Block Elements...")
     blocks_renderer = AsciiRenderer(
         width=130,
         aspect_ratio=0.50,
@@ -86,22 +86,34 @@ def test_single_image(image_path: Path):
     # (OUTPUT_DIR / f"{stem}_blocks.txt").write_text(blocks_ascii, encoding="utf-8")  # Disabled per user request
 
     # 4. Ultra-Sharp Unicode Braille (2x4 subpixels, razor clean)
-    print("[4/6] Running High-Resolution Unicode Braille...")
+    print("[4/7] Running High-Resolution Unicode Braille...")
     braille_ascii = clean_renderer.render_braille(image_path, threshold=110)
     # (OUTPUT_DIR / f"{stem}_braille.txt").write_text(braille_ascii, encoding="utf-8")  # Disabled per user request
 
     # 5. Clean Full-Color Studio HTML (No slash clutter, zero glow)
-    print("[5/6] Exporting Clean Studio Full-Color HTML...")
+    print("[5/7] Exporting Clean Studio Full-Color HTML...")
     html_output_path = OUTPUT_DIR / f"{stem}_color.html"
     clean_renderer.render_to_html(image_path, output_file=html_output_path, font_size=9)
     print(f"Saved: {html_output_path}")
 
     # 6. Interactive 60-FPS Natural Fluid Motion Player (Volcano Flow & Streamlines)
-    print("[6/6] Exporting 60-FPS Natural Fluid Motion Player (Volcano Flow)...")
+    print("[6/7] Exporting 60-FPS Natural Fluid Motion Player (Volcano Flow)...")
     motion_html_path = OUTPUT_DIR / f"{stem}_motion.html"
     # Use static mode so the motion HTML shows the same ASCII characters as the static HTML
     clean_renderer.render_motion_html(image_path, output_file=motion_html_path, font_size=10)
     print(f"Saved: {motion_html_path}")
+
+    # 7. Animated GIF with Fluid ASCII Motion (Portable & Embeddable for README/Web)
+    print("[7/7] Exporting Animated ASCII Motion GIF...")
+    gif_output_path = OUTPUT_DIR / f"{stem}_motion.gif"
+    clean_renderer.render_to_gif(
+        image_path,
+        output_file=gif_output_path,
+        num_frames=20,
+        fps=10,
+        font_size=9,
+    )
+    print(f"Saved: {gif_output_path}")
 
 
 def main():
