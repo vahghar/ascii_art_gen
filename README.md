@@ -1,3 +1,5 @@
+used a text to image model then custom rendered to ascii
+
 # Visual Comparisons
 
 ### Image 2
