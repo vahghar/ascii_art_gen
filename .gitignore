@@ -1,3 +1,6 @@
-output/
-test_images/
+# Ignore bulky HTML and text dumps, but keep GIFs for README comparisons
+output/*.html
+output/*.txt
+
 __pycache__/
+.venv/
