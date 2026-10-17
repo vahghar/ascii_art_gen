@@ -32,8 +32,8 @@ PALETTES = {
     "detailed": r" .'`^\",:;Il!i><~+_-?][}{1)(|\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
     # Halftone print dots (like ascii.rest)
     "dots": " ·•●",
-    # High-contrast minimal
-
+    # Pixel/block carriers — color-first, character is just a vessel
+    "pixel": " ░▒▓█",
     # Cross glyphs (architectural hatch)
     "cross": " +×",
     # Retro cyber/matrix
@@ -61,6 +61,8 @@ class AsciiRenderer:
         edge_detection: bool = False,
         edge_threshold: int = 95,
         edge_blend_ratio: float = 0.7,
+        shadow_lift: int = 0,
+        color_lift: int = 0,
     ):
         """
         :param width: Target width in characters.
@@ -74,6 +76,12 @@ class AsciiRenderer:
         :param edge_detection: Only outlines will use directional characters.
         :param edge_threshold: High gradient threshold (0-255) to trigger clean outlines only.
         :param edge_blend_ratio: Weight of edge overlay over pure luminance.
+        :param shadow_lift: Minimum luminance floor (0-80). Lifts pure-black areas so they
+            render as faint visible characters instead of invisible spaces. Useful for
+            dark images where detail is lost in the black background. Default 0 (no lift).
+        :param color_lift: Minimum per-channel RGB floor (0-80) applied when writing colors
+            in HTML output. Ensures dark-colored characters are visible on a dark background
+            instead of blending into it. Default 0 (no lift).
         """
         self.width = max(10, width)
         self.aspect_ratio = aspect_ratio
@@ -86,6 +94,8 @@ class AsciiRenderer:
         self.edge_detection = edge_detection
         self.edge_threshold = edge_threshold
         self.edge_blend_ratio = edge_blend_ratio
+        self.shadow_lift = max(0, min(80, shadow_lift))
+        self.color_lift = max(0, min(80, color_lift))
 
     def _calculate_dimensions(self, img_width: int, img_height: int) -> Tuple[int, int]:
         """Calculates character grid width and height maintaining visual proportions."""
@@ -120,10 +130,13 @@ class AsciiRenderer:
         """
         Accurately maps 0-255 luminance to a calibrated character without inversion bugs.
         If palette starts with space, 0 is space and 255 is dense.
+        shadow_lift floors the minimum luminance so dark areas get a visible character.
         """
         palette = self.palette
         palette_len = len(palette)
-        ratio = max(0.0, min(1.0, luminance / 255.0))
+        # Apply shadow lift: clamp luminance to [shadow_lift, 255]
+        effective_lum = max(self.shadow_lift, luminance) if self.shadow_lift > 0 else luminance
+        ratio = max(0.0, min(1.0, effective_lum / 255.0))
         if self.invert:
             ratio = 1.0 - ratio
 
@@ -338,6 +351,10 @@ class AsciiRenderer:
 
                 escaped_char = {"&": "&amp;", "<": "&lt;", ">": "&gt;", " ": "&nbsp;"}.get(char, char)
                 r, g, b = rgb_pixels[idx]
+                if self.color_lift > 0:
+                    r = max(self.color_lift, r)
+                    g = max(self.color_lift, g)
+                    b = max(self.color_lift, b)
                 line_parts.append(f'<span style="color:rgb({r},{g},{b})">{escaped_char}</span>')
 
             html_lines.append("".join(line_parts))
@@ -350,6 +367,7 @@ class AsciiRenderer:
     <meta charset="UTF-8">
     <title>Prompt-to-ASCII Output</title>
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400&display=swap');
         body {{
             background-color: {background};
             margin: 0;
@@ -360,17 +378,22 @@ class AsciiRenderer:
             min-height: 100vh;
         }}
         pre {{
-            font-family: "SF Mono", "Geist Mono", "JetBrains Mono", "Cascadia Code", "Fira Code", monospace;
+            font-family: "JetBrains Mono", "Cascadia Code", "SF Mono", "Fira Code", monospace;
             font-size: {font_size}px;
-            line-height: 0.65;
-            letter-spacing: 0.04em;
+            line-height: 1.0;
+            letter-spacing: 0.08em;
             user-select: all;
             background-color: {background};
             padding: 24px;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.06);
             border-radius: 12px;
-            box-shadow: 0 16px 48px rgba(0,0,0,0.7);
+            box-shadow: 0 16px 64px rgba(0,0,0,0.85);
             overflow: auto;
+        }}
+        /* Characters are color vessels — let the color bleed through */
+        pre span {{
+            filter: saturate(1.45);
+            text-shadow: 0 0 8px currentColor;
         }}
     </style>
 </head>
@@ -419,7 +442,7 @@ class AsciiRenderer:
             "clean": list(PALETTES["clean"]),
             "dots": list(PALETTES["dots"]),
             "detailed": list(PALETTES["detailed"]),
-            
+            "pixel": list(PALETTES["pixel"]),
         }
         palettes_json = json.dumps(palettes_dict)
 
@@ -553,8 +576,9 @@ class AsciiRenderer:
 
     <div class="controls">
         <span class="group-label">Style</span>
-        <button class="pill-btn style-btn active" data-style="clean">ASCII</button>
-        <button class="pill-btn style-btn" data-style="dots">Dots</button>
+        <button class="pill-btn style-btn" data-style="clean">ASCII</button>
+        <button class="pill-btn style-btn active" data-style="dots">Dots</button>
+        <button class="pill-btn style-btn" data-style="pixel">Blocks</button>
         <button class="pill-btn style-btn" data-style="detailed">Detailed</button>
 
 
@@ -562,10 +586,15 @@ class AsciiRenderer:
 
         <span class="group-label">Flow</span>
         <button class="pill-btn motion-btn motion-active" data-motion="flow">Natural Flow</button>
-        <button class="pill-btn motion-btn" data-motion="currents">Liquid Currents</button>
-
-        <button class="pill-btn motion-btn" data-motion="breath">Atmospheric</button>
         <button class="pill-btn motion-btn" data-motion="static">Static</button>
+
+        <div class="divider"></div>
+
+        <div class="slider-group">
+            <span>Size</span>
+            <input type="range" id="size-slider" min="0.5" max="2.5" step="0.1" value="1.0">
+            <span class="slider-val" id="size-val">1.0x</span>
+        </div>
 
         <div class="divider"></div>
 
@@ -689,9 +718,10 @@ class AsciiRenderer:
         let H = 60;
         let charW = 7;
         let charH = 11;
+        let charScale = 1.0;  // user-controlled size multiplier
 
         let grid = []; // 2D array of {{ lum, r, g, b }}
-        let currentStyle = 'detailed';
+        let currentStyle = 'dots';   // color-first default: dots = pure color vessels
         let currentMotion = 'flow';
         let speed = 1.0;
         let isPaused = false;
@@ -699,9 +729,11 @@ class AsciiRenderer:
 
         function resizeCanvas() {{
             if (!grid.length) return;
-            const availH = window.innerHeight - 100;
+            const controlsH = document.querySelector('.controls').offsetHeight;
+            const availH = window.innerHeight - controlsH - 64;  // 64px gap between canvas & bar
             const availW = window.innerWidth - 60;
-            charH = Math.max(6, Math.min(13, Math.floor(availH / H)));
+            const baseCharH = Math.max(6, Math.min(13, Math.floor(availH / H)));
+            charH = Math.round(baseCharH * charScale);
             charW = charH * 0.58;
             canvas.width = Math.floor(W * charW);
             canvas.height = Math.floor(H * charH);
@@ -808,8 +840,8 @@ class AsciiRenderer:
 
                     const cell = grid[sy][sx];
 
-                    // Pure contrast: deep background remains empty space
-                    if (cell.lum < 10) continue;
+                    // Skip only pixels below shadow_lift threshold (configurable, default 10)
+                    if (cell.lum < {self.shadow_lift if self.shadow_lift > 0 else 10}) continue;
 
                     // Calculate normalized luminance modulated by the flow
                     const baseNorm = cell.lum / 255.0;
@@ -821,14 +853,24 @@ class AsciiRenderer:
                     const charIdx = Math.max(0, Math.min(maxIdx, Math.round(dithered * maxIdx)));
                     const renderChar = pal[charIdx];
 
-                    // Pure, authentic image colors (no fake orange/green tinting!)
-                    // Preserve original colors; do not scale by flowFactor
-                    const r = Math.min(255, Math.floor(cell.r));
-                    const g = Math.min(255, Math.floor(cell.g));
-                    const b = Math.min(255, Math.floor(cell.b));
+                    // Color-first: boost saturation so colors define the image, chars are vessels
+                    // Saturate via HSL: amplify chroma relative to luminance
+                    const lNorm = cell.lum / 255.0;
+                    const SAT_BOOST = 1.55; // pull colors away from grey
+                    const CL = {self.color_lift}; // color_lift: minimum per-channel floor
+                    const rS = Math.min(255, Math.floor(lNorm * 255 + (cell.r - lNorm * 255) * SAT_BOOST));
+                    const gS = Math.min(255, Math.floor(lNorm * 255 + (cell.g - lNorm * 255) * SAT_BOOST));
+                    const bS = Math.min(255, Math.floor(lNorm * 255 + (cell.b - lNorm * 255) * SAT_BOOST));
+                    const r = Math.max(CL, Math.max(0, rS));
+                    const g = Math.max(CL, Math.max(0, gS));
+                    const b = Math.max(CL, Math.max(0, bS));
 
+                    // Subtle inner glow: draws the char twice — dim halo then crisp top layer
+                    ctx.shadowBlur = 6;
+                    ctx.shadowColor = `rgb(${{r}},${{g}},${{b}})`;
                     ctx.fillStyle = `rgb(${{r}},${{g}},${{b}})`;
                     ctx.fillText(renderChar, x * charW, y * charH);
+                    ctx.shadowBlur = 0;
                 }}
             }}
 
@@ -858,6 +900,14 @@ class AsciiRenderer:
         speedSlider.addEventListener('input', (e) => {{
             speed = parseFloat(e.target.value);
             speedVal.textContent = `${{speed.toFixed(1)}}x`;
+        }});
+
+        const sizeSlider = document.getElementById('size-slider');
+        const sizeVal = document.getElementById('size-val');
+        sizeSlider.addEventListener('input', (e) => {{
+            charScale = parseFloat(e.target.value);
+            sizeVal.textContent = `${{charScale.toFixed(1)}}x`;
+            resizeCanvas();
         }});
 
         const pauseBtn = document.getElementById('pause-btn');
@@ -976,6 +1026,8 @@ def main():
     parser.add_argument("-c", "--contrast", type=float, default=1.15, help="Contrast multiplier (e.g. 1.2)")
     parser.add_argument("-b", "--brightness", type=float, default=1.0, help="Brightness multiplier (e.g. 1.1)")
     parser.add_argument("-g", "--gamma", type=float, default=1.0, help="Gamma factor")
+    parser.add_argument("--shadow-lift", type=int, default=0, help="Minimum luminance floor 0-80 (lifts dark areas so they render as visible chars, not spaces)")
+    parser.add_argument("--color-lift", type=int, default=0, help="Minimum RGB channel floor 0-80 (makes dark-colored chars visible on dark backgrounds)")
     parser.add_argument("--edges", action="store_true", help="Enable directional edge detection outlines")
     parser.add_argument("--edge-thresh", type=int, default=95, help="Sobel edge sensitivity (default: 95)")
     parser.add_argument("--color", action="store_true", help="Output ANSI TrueColor for terminals")
@@ -996,6 +1048,8 @@ def main():
         contrast=args.contrast,
         brightness=args.brightness,
         gamma=args.gamma,
+        shadow_lift=args.shadow_lift,
+        color_lift=args.color_lift,
         edge_detection=args.edges,
         edge_threshold=args.edge_thresh,
     )

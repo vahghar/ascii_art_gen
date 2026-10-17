@@ -100,7 +100,7 @@ def test_single_image(image_path: Path):
     print("[6/6] Exporting 60-FPS Natural Fluid Motion Player (Volcano Flow)...")
     motion_html_path = OUTPUT_DIR / f"{stem}_motion.html"
     # Use static mode so the motion HTML shows the same ASCII characters as the static HTML
-    clean_renderer.render_motion_html(image_path, output_file=motion_html_path, font_size=10, motion='static')
+    clean_renderer.render_motion_html(image_path, output_file=motion_html_path, font_size=10)
     print(f"Saved: {motion_html_path}")
 
 
