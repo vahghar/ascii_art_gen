@@ -109,8 +109,8 @@ def test_single_image(image_path: Path):
     clean_renderer.render_to_gif(
         image_path,
         output_file=gif_output_path,
-        num_frames=20,
-        fps=10,
+        num_frames=32,
+        fps=16,
         font_size=9,
     )
     print(f"Saved: {gif_output_path}")

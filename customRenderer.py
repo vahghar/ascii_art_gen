@@ -34,6 +34,7 @@ PALETTES = {
     "dots": " ·•●",
     # Pixel/block carriers — color-first, character is just a vessel
     "pixel": " ░▒▓█",
+    "blocks": " ░▒▓█",
     # Cross glyphs (architectural hatch)
     "cross": " +×",
     # Retro cyber/matrix
@@ -41,6 +42,54 @@ PALETTES = {
     # Legacy standard
     "standard": "@%#*+=-:. ",
 }
+
+
+def _percentile(data: List[Union[int, float]], p: float) -> float:
+    """Computes the p-th percentile (0-100) of numerical data with graceful fallback."""
+    if not data:
+        return 0.0
+    try:
+        import numpy as np  # type: ignore
+        return float(np.percentile(data, p))
+    except (ImportError, Exception):
+        s = sorted(data)
+        k = (len(s) - 1) * (p / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return float(s[int(k)])
+        return float(s[int(f)] * (c - k) + s[int(c)] * (k - f))
+
+
+def calibrate_palette_for_font(palette: str, font: Union[ImageFont.ImageFont, ImageFont.FreeTypeFont]) -> str:
+    """
+    Measures actual pixel coverage of each character in the target font
+    and sorts the palette by measured optical density.
+    Preserves leading space at position 0 if present.
+    """
+    has_leading_space = palette.startswith(" ")
+    chars_to_measure = palette[1:] if has_leading_space else palette
+
+    densities = []
+    for char in chars_to_measure:
+        if char == " ":
+            densities.append((0.0, char))
+            continue
+        try:
+            bbox = font.getbbox(char)
+            cw = max(1, bbox[2] - bbox[0])
+            ch = max(1, bbox[3] - bbox[1])
+            test_img = Image.new("L", (cw + 4, ch + 4), 0)
+            test_draw = ImageDraw.Draw(test_img)
+            test_draw.text((2 - bbox[0], 2 - bbox[1]), char, fill=255, font=font)
+            coverage = sum(test_img.getdata()) / (255.0 * test_img.width * test_img.height)
+            densities.append((coverage, char))
+        except Exception:
+            densities.append((0.5, char))
+
+    densities.sort(key=lambda item: item[0])
+    sorted_chars = "".join(item[1] for item in densities)
+    return (" " + sorted_chars) if has_leading_space else sorted_chars
 
 
 class AsciiRenderer:
@@ -63,6 +112,9 @@ class AsciiRenderer:
         edge_blend_ratio: float = 0.7,
         shadow_lift: int = 0,
         color_lift: int = 0,
+        adaptive_histogram: bool = True,
+        local_contrast: bool = True,
+        sharpen: bool = True,
     ):
         """
         :param width: Target width in characters.
@@ -82,6 +134,11 @@ class AsciiRenderer:
         :param color_lift: Minimum per-channel RGB floor (0-80) applied when writing colors
             in HTML output. Ensures dark-colored characters are visible on a dark background
             instead of blending into it. Default 0 (no lift).
+        :param adaptive_histogram: Adaptively stretch image luminance range across the full palette
+            and apply a perceptual 0.7 gamma curve (fixes clustering in dark 2-3 characters).
+        :param local_contrast: Apply CLAHE-style adaptive equalization blend to bring out details
+            in dark and high-contrast areas.
+        :param sharpen: Apply post-resize unsharp mask to recover edges and textures lost in downscaling.
         """
         self.width = max(10, width)
         self.aspect_ratio = aspect_ratio
@@ -96,6 +153,9 @@ class AsciiRenderer:
         self.edge_blend_ratio = edge_blend_ratio
         self.shadow_lift = max(0, min(80, shadow_lift))
         self.color_lift = max(0, min(80, color_lift))
+        self.adaptive_histogram = adaptive_histogram
+        self.local_contrast = local_contrast
+        self.sharpen = sharpen
 
     def _calculate_dimensions(self, img_width: int, img_height: int) -> Tuple[int, int]:
         """Calculates character grid width and height maintaining visual proportions."""
@@ -103,9 +163,22 @@ class AsciiRenderer:
         new_height = int(img_height * scale * self.aspect_ratio)
         return self.width, max(1, new_height)
 
-    def _preprocess_image(self, img: Image.Image) -> Image.Image:
-        """Applies brightness, contrast, and gamma adjustments."""
+    def _preprocess_image(
+        self,
+        img: Image.Image,
+        target_size: Optional[Tuple[int, int]] = None,
+    ) -> Image.Image:
+        """
+        Applies brightness, contrast, gamma, and local contrast (CLAHE-style) adjustments.
+        When target_size is provided, applies structure-preserving LANCZOS downsampling
+        and a post-resize unsharp mask sharpening pass to recover lost edge details.
+        """
         img = img.convert("RGB")
+
+        # P1: Local contrast adaptation (CLAHE / adaptive histogram equalization blend)
+        if self.local_contrast:
+            eq = ImageOps.equalize(img)
+            img = Image.blend(img, eq, 0.35)
 
         if self.brightness != 1.0:
             enhancer = ImageEnhance.Brightness(img)
@@ -124,19 +197,37 @@ class AsciiRenderer:
             lut = [int(((i / 255.0) ** inv_gamma) * 255) for i in range(256)] * 3
             img = img.point(lut)
 
+        # P0: Structure-preserving downscale & post-resize sharpening pass
+        if target_size is not None:
+            img = img.resize(target_size, Image.Resampling.LANCZOS)
+            if self.sharpen:
+                img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=80, threshold=2))
+
         return img
 
-    def _map_luminance_to_char(self, luminance: int) -> str:
+    def _map_luminance_to_char(
+        self,
+        luminance: int,
+        min_lum: float = 0.0,
+        max_lum: float = 255.0,
+    ) -> str:
         """
-        Accurately maps 0-255 luminance to a calibrated character without inversion bugs.
-        If palette starts with space, 0 is space and 255 is dense.
+        Accurately maps luminance to a calibrated character without inversion bugs.
+        Applies adaptive histogram equalization (normalizes to image's actual dynamic range
+        and applies a perceptual 0.7 gamma curve) so images use the full palette including
+        dense characters (#, %, @) rather than clustering in space/dot/colon.
         shadow_lift floors the minimum luminance so dark areas get a visible character.
         """
         palette = self.palette
         palette_len = len(palette)
-        # Apply shadow lift: clamp luminance to [shadow_lift, 255]
         effective_lum = max(self.shadow_lift, luminance) if self.shadow_lift > 0 else luminance
-        ratio = max(0.0, min(1.0, effective_lum / 255.0))
+
+        if self.adaptive_histogram and max_lum > min_lum:
+            ratio = max(0.0, min(1.0, (effective_lum - min_lum) / (max_lum - min_lum)))
+            ratio = ratio ** 0.7  # Perceptual gamma curve to spread midtones
+        else:
+            ratio = max(0.0, min(1.0, effective_lum / 255.0))
+
         if self.invert:
             ratio = 1.0 - ratio
 
@@ -145,7 +236,7 @@ class AsciiRenderer:
         else:
             idx = int((1.0 - ratio) * (palette_len - 1))
 
-        return palette[idx]
+        return palette[min(palette_len - 1, max(0, idx))]
 
     def _compute_edges_and_directions(self, gray_img: Image.Image) -> Tuple[List[List[float]], List[List[str]]]:
         """
@@ -227,7 +318,7 @@ class AsciiRenderer:
             img = image_input
 
         target_w, target_h = self._calculate_dimensions(img.width, img.height)
-        processed_rgb = self._preprocess_image(img).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        processed_rgb = self._preprocess_image(img, target_size=(target_w, target_h))
         gray_img = processed_rgb.convert("L")
 
         if self.invert:
@@ -240,6 +331,9 @@ class AsciiRenderer:
         gray_pixels = list(gray_img.getdata())
         rgb_pixels = list(processed_rgb.getdata()) if color else None
 
+        min_lum = _percentile(gray_pixels, 2) if self.adaptive_histogram and gray_pixels else 0.0
+        max_lum = _percentile(gray_pixels, 98) if self.adaptive_histogram and gray_pixels else 255.0
+
         lines = []
         for y in range(target_h):
             line_chars = []
@@ -251,7 +345,7 @@ class AsciiRenderer:
                 if self.edge_detection and edge_chars and edge_chars[y][x]:
                     char = edge_chars[y][x]
                 else:
-                    char = self._map_luminance_to_char(brightness_val)
+                    char = self._map_luminance_to_char(brightness_val, min_lum, max_lum)
 
                 if color and rgb_pixels:
                     r, g, b = rgb_pixels[idx]
@@ -281,11 +375,18 @@ class AsciiRenderer:
         hires_h = int((img.height / img.width) * hires_w * (self.aspect_ratio * 2))
         hires_h = max(4, (hires_h // 4) * 4)
 
-        gray = self._preprocess_image(img).resize((hires_w, hires_h), Image.Resampling.LANCZOS).convert("L")
+        gray = self._preprocess_image(img, target_size=(hires_w, hires_h)).convert("L")
         if self.invert:
             gray = ImageOps.invert(gray)
 
         data = list(gray.getdata())
+        eff_threshold = threshold
+        if self.adaptive_histogram and data:
+            min_lum = _percentile(data, 2)
+            max_lum = _percentile(data, 98)
+            if max_lum > min_lum:
+                eff_threshold = int(min_lum + (threshold / 255.0) * (max_lum - min_lum))
+
         lines = []
 
         for cy in range(0, hires_h, 4):
@@ -301,7 +402,7 @@ class AsciiRenderer:
                     px = cx + dx
                     py = cy + dy
                     if px < hires_w and py < hires_h:
-                        if data[py * hires_w + px] >= threshold:
+                        if data[py * hires_w + px] >= eff_threshold:
                             mask |= bit
                 line.append(chr(0x2800 + mask))
             lines.append("".join(line))
@@ -324,7 +425,7 @@ class AsciiRenderer:
             img = image_input
 
         target_w, target_h = self._calculate_dimensions(img.width, img.height)
-        processed_rgb = self._preprocess_image(img).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        processed_rgb = self._preprocess_image(img, target_size=(target_w, target_h))
         gray_img = processed_rgb.convert("L")
 
         if self.invert:
@@ -337,6 +438,9 @@ class AsciiRenderer:
         gray_pixels = list(gray_img.getdata())
         rgb_pixels = list(processed_rgb.getdata())
 
+        min_lum = _percentile(gray_pixels, 2) if self.adaptive_histogram and gray_pixels else 0.0
+        max_lum = _percentile(gray_pixels, 98) if self.adaptive_histogram and gray_pixels else 255.0
+
         html_lines = []
         for y in range(target_h):
             line_parts = []
@@ -347,7 +451,7 @@ class AsciiRenderer:
                 if self.edge_detection and edge_chars and edge_chars[y][x]:
                     char = edge_chars[y][x]
                 else:
-                    char = self._map_luminance_to_char(brightness_val)
+                    char = self._map_luminance_to_char(brightness_val, min_lum, max_lum)
 
                 escaped_char = {"&": "&amp;", "<": "&lt;", ">": "&gt;", " ": "&nbsp;"}.get(char, char)
                 r, g, b = rgb_pixels[idx]
@@ -721,6 +825,8 @@ class AsciiRenderer:
         let charScale = 1.0;  // user-controlled size multiplier
 
         let grid = []; // 2D array of {{ lum, r, g, b }}
+        let minLum = 0;
+        let maxLum = 255;
         let currentStyle = 'dots';   // color-first default: dots = pure color vessels
         let currentMotion = 'flow';
         let speed = 1.0;
@@ -751,6 +857,7 @@ class AsciiRenderer:
             const imgData = offCtx.getImageData(0, 0, W, H).data;
 
             grid = [];
+            const allLums = [];
             for (let y = 0; y < H; y++) {{
                 const row = [];
                 for (let x = 0; x < W; x++) {{
@@ -759,9 +866,16 @@ class AsciiRenderer:
                     const g = imgData[idx + 1];
                     const b = imgData[idx + 2];
                     const lum = Math.floor(0.299 * r + 0.587 * g + 0.114 * b);
+                    allLums.push(lum);
                     row.push({{ lum, r, g, b }});
                 }}
                 grid.push(row);
+            }}
+
+            if (allLums.length > 0) {{
+                allLums.sort((a, b) => a - b);
+                minLum = allLums[Math.floor(allLums.length * 0.02)] || 0;
+                maxLum = allLums[Math.floor(allLums.length * 0.98)] || 255;
             }}
 
             resizeCanvas();
@@ -840,11 +954,14 @@ class AsciiRenderer:
 
                     const cell = grid[sy][sx];
 
-                    // Skip only pixels below shadow_lift threshold (configurable, default 10)
-                    if (cell.lum < {self.shadow_lift if self.shadow_lift > 0 else 10}) continue;
+                    // Adaptive cutoff preserving dark features
+                    const cutoff = Math.min({self.shadow_lift if self.shadow_lift > 0 else 10}, minLum + 2);
+                    if (cell.lum < cutoff) continue;
 
-                    // Calculate normalized luminance modulated by the flow
-                    const baseNorm = cell.lum / 255.0;
+                    // Adaptive histogram equalization with perceptual gamma curve (Fix #1)
+                    const lumRange = Math.max(1, maxLum - minLum);
+                    const normLum = Math.max(0, Math.min(1.0, (cell.lum - minLum) / lumRange));
+                    const baseNorm = Math.pow(normLum, 0.7);
                     const modulatedNorm = Math.max(0, Math.min(1.0, baseNorm * flowFactor));
 
                     // Bayer ordered dither transition (THE secret to ascii.rest's natural dissolving flow)
@@ -944,7 +1061,7 @@ class AsciiRenderer:
             img = image_input
 
         target_w, target_h = self._calculate_dimensions(img.width, img.height)
-        processed_rgb = self._preprocess_image(img).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        processed_rgb = self._preprocess_image(img, target_size=(target_w, target_h))
         gray_img = processed_rgb.convert("L")
 
         if self.invert:
@@ -952,6 +1069,10 @@ class AsciiRenderer:
 
         gray_pixels = list(gray_img.getdata())
         rgb_pixels = list(processed_rgb.getdata())
+
+        min_lum = _percentile(gray_pixels, 2) if self.adaptive_histogram and gray_pixels else 0.0
+        max_lum = _percentile(gray_pixels, 98) if self.adaptive_histogram and gray_pixels else 255.0
+        lum_cutoff = self.shadow_lift if self.shadow_lift > 0 else max(4, int(min_lum))
 
         frame_delay = 1.0 / max(1, fps)
         start_time = time.time()
@@ -976,7 +1097,7 @@ class AsciiRenderer:
                         lum = gray_pixels[idx]
                         r, g, b = rgb_pixels[idx]
 
-                        if lum < 10:
+                        if lum < lum_cutoff:
                             line_chars.append(" ")
                             continue
 
@@ -1001,7 +1122,7 @@ class AsciiRenderer:
                         # Preserve original RGB colors; do not dim them with flow_factor
                         final_r, final_g, final_b = r, g, b
 
-                        char = self._map_luminance_to_char(eff_lum)
+                        char = self._map_luminance_to_char(eff_lum, min_lum, max_lum)
                         line_chars.append(f"\033[38;2;{final_r};{final_g};{final_b}m{char}\033[0m")
 
                     lines.append("".join(line_chars))
@@ -1021,22 +1142,24 @@ class AsciiRenderer:
         self,
         image_input: Union[str, Path, Image.Image],
         output_file: Union[str, Path],
-        num_frames: int = 24,
-        fps: int = 12,
+        num_frames: int = 32,
+        fps: int = 16,
         font_size: int = 10,
-        background: Tuple[int, int, int] = (4, 4, 6),
+        background: Tuple[int, int, int] = (10, 10, 16),
         font_path: Optional[str] = None,
+        calibrate_font: bool = True,
     ) -> Path:
         """
         Renders the ASCII art as an animated GIF with flowing character motion.
-        Characters oscillate through the palette over time using sinusoidal flow,
-        simulating the HTML motion player in a portable, embeddable GIF format.
+        Includes adaptive histogram equalization, font calibration, subtle glow,
+        and MAXCOVERAGE dithering for vibrant, space-efficient output.
 
-        :param num_frames: Number of animation frames (24 = smooth ~2s loop).
-        :param fps: Frames per second.
-        :param font_size: Character height in pixels. Smaller = more detail, larger file.
-        :param background: RGB background colour tuple.
-        :param font_path: Path to a .ttf monospace font. Falls back to system fonts, then PIL default.
+        :param num_frames: Number of animation frames (32 = smooth ~2s loop).
+        :param fps: Frames per second (16 = fluid motion).
+        :param font_size: Character height in pixels.
+        :param background: RGB background colour tuple (default #0a0a10).
+        :param font_path: Path to a .ttf monospace font.
+        :param calibrate_font: Order palette characters by actual font cell optical density.
         :return: Path to the saved GIF.
         """
         if isinstance(image_input, (str, Path)):
@@ -1045,9 +1168,7 @@ class AsciiRenderer:
             img = image_input
 
         target_w, target_h = self._calculate_dimensions(img.width, img.height)
-        processed_rgb = self._preprocess_image(img).resize(
-            (target_w, target_h), Image.Resampling.LANCZOS
-        )
+        processed_rgb = self._preprocess_image(img, target_size=(target_w, target_h))
         gray_img = processed_rgb.convert("L")
         if self.invert:
             gray_img = ImageOps.invert(gray_img)
@@ -1058,6 +1179,10 @@ class AsciiRenderer:
 
         gray_pixels = list(gray_img.getdata())
         rgb_pixels = list(processed_rgb.getdata())
+
+        min_lum = _percentile(gray_pixels, 2) if self.adaptive_histogram and gray_pixels else 0.0
+        max_lum = _percentile(gray_pixels, 98) if self.adaptive_histogram and gray_pixels else 255.0
+        lum_range = max(1.0, max_lum - min_lum)
 
         # ── Font resolution ────────────────────────────────────────────────────
         font: ImageFont.ImageFont | ImageFont.FreeTypeFont
@@ -1070,10 +1195,12 @@ class AsciiRenderer:
                 pass
         if not _loaded:
             for _fname in [
-                "cour.ttf", "courbd.ttf",           # Windows Courier New
-                "DejaVuSansMono.ttf",               # Linux / macOS
+                "consola.ttf", "consolab.ttf",              # Windows Consolas
+                "cour.ttf", "courbd.ttf",                   # Windows Courier New
+                "CascadiaMono.ttf", "CascadiaCode.ttf",     # Windows Cascadia
+                "DejaVuSansMono.ttf",                       # Linux / macOS
                 "LiberationMono-Regular.ttf",
-                "Menlo.ttc",                        # macOS
+                "Menlo.ttc",                                # macOS
             ]:
                 try:
                     font = ImageFont.truetype(_fname, font_size)
@@ -1084,6 +1211,10 @@ class AsciiRenderer:
         if not _loaded:
             font = ImageFont.load_default()
 
+        # P3: Calibrate palette order to actual font cell optical density
+        palette = calibrate_palette_for_font(self.palette, font) if calibrate_font else self.palette
+        palette_len = len(palette)
+
         # Character cell size
         _bbox = font.getbbox("W")
         char_w = max(1, _bbox[2] - _bbox[0])
@@ -1092,9 +1223,8 @@ class AsciiRenderer:
         canvas_w = target_w * char_w
         canvas_h = target_h * char_h
 
-        palette = self.palette
-        palette_len = len(palette)
-        lum_cutoff = max(10, self.shadow_lift)
+        # Adaptive cutoff: preserves dark subject matter instead of wasting 90% frame area
+        lum_cutoff = self.shadow_lift if self.shadow_lift > 0 else max(4, int(min_lum))
         frame_ms = max(20, int(1000 / fps))
 
         frames: List[Image.Image] = []
@@ -1118,12 +1248,17 @@ class AsciiRenderer:
                     if self.edge_detection and edge_chars and edge_chars[y][x]:
                         char = edge_chars[y][x]
                     else:
-                        # Sinusoidal flow: subtly oscillate the palette index over time
-                        base_ratio = lum / 255.0
+                        effective_lum = max(self.shadow_lift, lum) if self.shadow_lift > 0 else lum
+                        if self.adaptive_histogram and max_lum > min_lum:
+                            base_ratio = max(0.0, min(1.0, (effective_lum - min_lum) / lum_range)) ** 0.7
+                        else:
+                            base_ratio = effective_lum / 255.0
+
+                        # Flow oscillation: increased to ±22% for visible fluid motion in GIF (P2)
                         noise = (
                             math.sin(x * 0.18 + t * 1.1) * 0.5
                             + math.sin(y * 0.14 - t * 0.85) * 0.5
-                        ) * 0.14  # ±14% oscillation — visible but not distracting
+                        ) * 0.22
                         ratio = max(0.0, min(1.0, base_ratio + noise))
                         if self.invert:
                             ratio = 1.0 - ratio
@@ -1131,7 +1266,7 @@ class AsciiRenderer:
                             char_idx = int(ratio * (palette_len - 1))
                         else:
                             char_idx = int((1.0 - ratio) * (palette_len - 1))
-                        char = palette[char_idx]
+                        char = palette[min(palette_len - 1, max(0, char_idx))]
 
                     if char == " ":
                         continue
@@ -1142,13 +1277,23 @@ class AsciiRenderer:
                         g = max(self.color_lift, g)
                         b = max(self.color_lift, b)
 
+                    # Subtle inner glow / halo matching HTML output glow effect (P2)
+                    halo_color = (max(0, r // 4), max(0, g // 4), max(0, b // 4))
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        draw.text((x * char_w + dx, y * char_h + dy), char, fill=halo_color, font=font)
+
                     draw.text((x * char_w, y * char_h), char, fill=(r, g, b), font=font)
 
             frames.append(frame_img)
 
         out_path = Path(output_file)
-        # GIF is 256-colour; convert each frame via quantize for best quality
-        pal_frames = [f.quantize(colors=256, method=Image.Quantize.MEDIANCUT) for f in frames]
+        # P1: MAXCOVERAGE quantization + Floyd-Steinberg dithering to preserve subtle hues
+        quantize_method = getattr(Image.Quantize, "MAXCOVERAGE", Image.Quantize.MEDIANCUT)
+        dither_method = getattr(Image.Dither, "FLOYDSTEINBERG", Image.Dither.NONE)
+        pal_frames = [
+            f.quantize(colors=256, method=quantize_method, dither=dither_method)
+            for f in frames
+        ]
         pal_frames[0].save(
             out_path,
             format="GIF",
@@ -1176,12 +1321,15 @@ def main():
     parser.add_argument("--edge-thresh", type=int, default=95, help="Sobel edge sensitivity (default: 95)")
     parser.add_argument("--color", action="store_true", help="Output ANSI TrueColor for terminals")
     parser.add_argument("--invert", action="store_true", help="Invert luminance mapping")
+    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive histogram equalization")
+    parser.add_argument("--no-local-contrast", action="store_true", help="Disable local contrast enhancement")
+    parser.add_argument("--no-sharpen", action="store_true", help="Disable post-resize sharpening")
     parser.add_argument("-o", "--output", type=str, help="Save plain text output to file")
     parser.add_argument("--html", type=str, help="Export styled HTML output to file")
     parser.add_argument("--motion-html", type=str, help="Export interactive 60-FPS natural flow HTML player")
     parser.add_argument("--gif", type=str, help="Export animated GIF with flowing character motion")
-    parser.add_argument("--gif-frames", type=int, default=24, help="Number of GIF animation frames (default: 24)")
-    parser.add_argument("--gif-fps", type=int, default=12, help="GIF frames per second (default: 12)")
+    parser.add_argument("--gif-frames", type=int, default=32, help="Number of GIF animation frames (default: 32)")
+    parser.add_argument("--gif-fps", type=int, default=16, help="GIF frames per second (default: 16)")
     parser.add_argument("--live", choices=["flow", "currents", "wave", "breath"], help="Play live natural flow motion in terminal")
     parser.add_argument("--fps", type=int, default=24, help="FPS for live terminal motion (default: 24)")
 
@@ -1199,6 +1347,9 @@ def main():
         color_lift=args.color_lift,
         edge_detection=args.edges,
         edge_threshold=args.edge_thresh,
+        adaptive_histogram=not args.no_adaptive,
+        local_contrast=not args.no_local_contrast,
+        sharpen=not args.no_sharpen,
     )
 
     if args.live:
