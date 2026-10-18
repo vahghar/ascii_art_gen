@@ -1183,7 +1183,6 @@ class AsciiRenderer:
         min_lum = _percentile(gray_pixels, 2) if self.adaptive_histogram and gray_pixels else 0.0
         max_lum = _percentile(gray_pixels, 98) if self.adaptive_histogram and gray_pixels else 255.0
         lum_range = max(1.0, max_lum - min_lum)
-
         # ── Font resolution ────────────────────────────────────────────────────
         font: ImageFont.ImageFont | ImageFont.FreeTypeFont
         _loaded = False
