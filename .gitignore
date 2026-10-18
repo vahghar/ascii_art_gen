@@ -4,3 +4,7 @@ output/*.txt
 
 __pycache__/
 .venv/
+
+.env
+
+serverless.py

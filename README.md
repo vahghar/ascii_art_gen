@@ -22,4 +22,12 @@ used a text to image model to generate image then custom rendered to ascii
 
 | Original | ASCII Motion |
 | :---: | :---: |
+| <img src="output/serverless_raw.png" width="450" /> | <img src="output/serverless_motion.gif" width="450" /> |
+
+---
+
+### Image 4
+
+| Original | ASCII Motion |
+| :---: | :---: |
 | <img src="test_images/image2.png" width="450" /> | <img src="output/image2_motion.gif" width="450" /> |
